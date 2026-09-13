@@ -1,7 +1,8 @@
-//! Bounded, allocation-free parser for UniFi-style 802.11r RRB frames,
-//! shared verbatim by the eBPF action and by host-side offline inspection.
+//! Bounded, allocation-free parser for UniFi-style 802.11r RRB frames.
+//! Runs in the userspace daemon, which validates a wire frame against the
+//! configured [`Filter`] before injecting it into the relay TAP.
 //!
-//! Frame layout expected at the switch-facing TC ingress hook:
+//! Frame layout on the wire at the switch-facing port:
 //!
 //! ```text
 //!  0        6        12   14           18
@@ -11,11 +12,13 @@
 //!
 //! The outer service VLAN has already selected the interface by the time the
 //! frame reaches us; exactly one inner 802.1Q management tag must remain,
-//! either as skb metadata (`vlan_present`) or inline in the frame.
+//! either inline in the frame or reported via `PACKET_AUXDATA` metadata
+//! (`vlan_present`) when the NIC/driver offloaded it.
 //!
-//! Every reader must return `None` on any out-of-bounds access: the BPF
-//! verifier has to see that all reads are guarded.
-use crate::{Config, Counter, MAX_FRAME, MAX_PEERS, MAX_R0KH, MAX_TLVS};
+//! Every reader must return `None` on any out-of-bounds access.
+use crate::proto::{
+    Counter, Filter, MAX_FRAME, MAX_LOCALS, MAX_PEER_BSSIDS, MAX_PEERS, MAX_R0KH, MAX_TLVS,
+};
 
 /// EtherType assigned to 802.11r RRB (Fast BSS Transition over the
 /// distribution system): "RRB" frames between APs.
@@ -67,8 +70,8 @@ pub const TRAILER_LEN: usize = 16;
 /// Broadcast destination, written longhand where comparisons happen.
 pub const BROADCAST: [u8; 6] = [255; 6];
 
-/// Byte-slice view of a frame, so the same parser runs on a userspace buffer
-/// and (via the eBPF impl) on `bpf_skb_load_bytes` reads.
+/// Byte-slice view of a frame, so the parser is testable on plain buffers and
+/// the read bounds are enforced in one place.
 pub trait ReadFrame {
     fn len(&self) -> usize;
     /// Read exactly `N` bytes at `offset`, or `None` if out of bounds.
@@ -115,19 +118,19 @@ pub struct Match {
 /// Full ingress gate: geometry, VLAN scope, Ethernet addresses, RRB header,
 /// TLV stream, and broadcast restrictions, in that order.
 ///
-/// Errors map 1:1 to `Counter` rejection slots so the kernel side can count
-/// why a frame was left alone.
+/// Errors map 1:1 to `Counter` rejection slots so the daemon can count why a
+/// frame was dropped.
 #[inline(always)]
-pub fn classify<R: ReadFrame>(r: &R, vlan: Vlan, c: &Config) -> Result<Match, Counter> {
+pub fn classify<R: ReadFrame>(r: &R, vlan: Vlan, f: &Filter) -> Result<Match, Counter> {
     if r.len() < ETH_HEADER_LEN || r.len() > MAX_FRAME {
         return Err(Counter::Length);
     }
     let proto = u16::from_be_bytes(r.read::<2>(ETH_TYPE_OFFSET).ok_or(Counter::Length)?);
     let body = if vlan.present {
-        // Tag lives in skb metadata: the on-wire EtherType must already be
-        // RRB, and the metadata tag must be our management VLAN.
+        // Tag lives in PACKET_AUXDATA metadata: the on-wire EtherType must
+        // already be RRB, and the metadata tag must be our management VLAN.
         if vlan.proto != TPID_8021Q
-            || vlan.tci & TCI_VID_MASK != c.management_vlan
+            || vlan.tci & TCI_VID_MASK != f.management_vlan
             || proto != ETH_P_RRB
         {
             return Err(Counter::Vlan);
@@ -139,36 +142,35 @@ pub fn classify<R: ReadFrame>(r: &R, vlan: Vlan, c: &Config) -> Result<Match, Co
         // out and ignored on purpose.
         let tag = r.read::<4>(ETH_HEADER_LEN).ok_or(Counter::Vlan)?;
         if proto != TPID_8021Q
-            || u16::from_be_bytes([tag[0], tag[1]]) & TCI_VID_MASK != c.management_vlan
+            || u16::from_be_bytes([tag[0], tag[1]]) & TCI_VID_MASK != f.management_vlan
             || tag[2..4] != ETH_P_RRB.to_be_bytes()
         {
             return Err(Counter::Vlan);
         }
         ETH_HEADER_LEN + VLAN_TAG_LEN
     };
-    parse_rrb(r, body, c)
+    parse_rrb(r, body, f)
 }
 
 /// Validate the RRB body starting at `body` against the configured identity.
 #[inline(always)]
-pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, c: &Config) -> Result<Match, Counter> {
+pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, f: &Filter) -> Result<Match, Counter> {
     let dst = r.read::<6>(0).ok_or(Counter::Length)?;
     let src = r.read::<6>(6).ok_or(Counter::Length)?;
     // Addressed to our bridge, or broadcast (PULL/SEQ_REQ discovery).
-    if dst != c.target_mac && dst != BROADCAST {
+    if dst != f.target_mac && dst != BROADCAST {
         return Err(Counter::EtherAddress);
     }
     // Bounded scan over configured peers; the loop bound is MAX_PEERS, not
-    // peer_count, so the verifier sees a statically bounded loop.
-    let mut expected_bss = [0u8; 6];
-    let mut peer_found = false;
+    // peer_count, so it stays statically bounded. peer_count == 0 is a
+    // wildcard: any sender is accepted as a peer.
+    let mut matched_peer: Option<usize> = None;
     for i in 0..MAX_PEERS {
-        if i < c.peer_count as usize && c.peers[i].mac == src {
-            expected_bss = c.peers[i].bssid;
-            peer_found = true;
+        if i < f.peer_count as usize && f.peers[i].mac == src {
+            matched_peer = Some(i);
         }
     }
-    if !peer_found {
+    if f.peer_count > 0 && matched_peer.is_none() {
         return Err(Counter::EtherAddress);
     }
 
@@ -177,13 +179,35 @@ pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, c: &Config) -> Result<Match, 
     if header[..5] != RRB_SELECTOR || header[5] < KIND_PULL || header[5] > KIND_SEQ_RESPONSE {
         return Err(Counter::OuiType);
     }
-    // The BSS the frame claims to originate from must be the peer's own.
-    if header[6..12] != expected_bss {
-        return Err(Counter::SourceBss);
+    // The BSS the frame claims to originate from must be one of the peer's
+    // BSSIDs; an empty peer BSSID list is a wildcard.
+    if let Some(i) = matched_peer {
+        let peer = &f.peers[i];
+        if peer.bssid_count > 0 {
+            let mut bss_found = false;
+            for j in 0..MAX_PEER_BSSIDS {
+                if j < peer.bssid_count as usize && peer.bssids[j] == header[6..12] {
+                    bss_found = true;
+                }
+            }
+            if !bss_found {
+                return Err(Counter::SourceBss);
+            }
+        }
     }
     let broadcast = header[12..18] == BROADCAST;
-    if !broadcast && header[12..18] != c.local_bssid {
-        return Err(Counter::DestinationBss);
+    if !broadcast {
+        // Unicast destination BSS must be one of our configured local BSSes;
+        // bounded scan like the peer scan above.
+        let mut local_found = false;
+        for i in 0..MAX_LOCALS {
+            if i < f.local_count as usize && f.locals[i].bssid == header[12..18] {
+                local_found = true;
+            }
+        }
+        if !local_found {
+            return Err(Counter::DestinationBss);
+        }
     }
     // Auth-data length is little-endian on the wire.
     let alen = u16::from_le_bytes([header[18], header[19]]) as usize;
@@ -230,24 +254,36 @@ pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, c: &Config) -> Result<Match, 
 
     // Broadcast frames are how an intruder would spray RRB onto the segment,
     // so they face an extra restriction: only PULL and SEQ_REQ may be
-    // broadcast, and they must name exactly our R0KH-ID. The comparison runs
-    // once, after TLV validation, to avoid a nested variable-length loop
-    // that would explode verifier path count.
+    // broadcast, and they must name exactly one of our locals' R0KH-IDs. The
+    // comparison runs once, after TLV validation, so the variable-length
+    // compare never nests inside the TLV walk.
     if broadcast {
         if (header[5] != KIND_PULL && header[5] != KIND_SEQ_REQUEST)
             || r0kh_size == 0
             || r0kh_size > MAX_R0KH
-            || r0kh_size != c.r0kh_len as usize
         {
             return Err(Counter::BroadcastScope);
         }
-        for j in 0..MAX_R0KH {
-            if j == r0kh_size {
-                break;
+        let mut r0kh_found = false;
+        for i in 0..MAX_LOCALS {
+            if i >= f.local_count as usize || f.locals[i].r0kh_len as usize != r0kh_size {
+                continue;
             }
-            if r.read::<1>(r0kh_position + j).ok_or(Counter::Tlv)?[0] != c.r0kh[j] {
-                return Err(Counter::BroadcastScope);
+            let mut identical = true;
+            for j in 0..MAX_R0KH {
+                if j == r0kh_size {
+                    break;
+                }
+                if r.read::<1>(r0kh_position + j).ok_or(Counter::Tlv)?[0] != f.locals[i].r0kh[j] {
+                    identical = false;
+                }
             }
+            if identical {
+                r0kh_found = true;
+            }
+        }
+        if !r0kh_found {
+            return Err(Counter::BroadcastScope);
         }
     }
     Ok(Match {

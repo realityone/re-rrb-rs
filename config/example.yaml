@@ -1,0 +1,32 @@
+# rerrb example config (UDR 5G Max values)
+#
+# Sources are the switch-facing ports RRB frames arrive on; aps are the local
+# AP interfaces this relay serves; peers are the other APs allowed to send us
+# RRB. r0kh_id defaults to the AP interface's BSSID in lowercase hex without
+# colons (UniFi: the R0KH-ID is the BSSID, e.g. wifi1ap4 at 22:0b:8b:ea:60:c9
+# -> "220b8bea60c9"), so it only needs spelling out to override that.
+
+sources: [eth1, eth2]
+
+aps:
+  - interface: wifi1ap4
+  # - interface: wifi0ap3
+  #   r0kh_id: "220b8bea60c8"   # explicit override, 1..=48 ASCII bytes
+
+# peers may be omitted entirely (accept any sender). A peer with an empty
+# bssids list is filled with every BSSID this host's hostapd manages, i.e.
+# all /run/hostapd/wifi* control sockets (GET_CONFIG -> bssid).
+peers:
+  - mac: "1c:0b:8b:ea:60:c9"      # Ethernet source the peer sends from
+    bssids:                        # BSSIDs it may claim in the RRB header
+      - "1c:0b:8b:ea:60:c9"
+      - "22:0b:8b:ea:60:c9"
+  # - mac: "1c:0b:8b:ea:60:c8"    # bssids omitted: all local hostapd BSSIDs
+
+target: br0            # bridge hostapd listens on (mirred redirect target)
+management_vlan: 1     # 802.1Q VID RRB frames carry on the wire
+mode: forward          # observe = validate/count only, never creates the TAP
+limits:
+  packets_per_second: 20   # shared fixed-window relay budget
+tap: rrb0              # name of the relay TAP to create
+pref: 49152            # TC filter priority on the TAP (0xC000)
