@@ -17,23 +17,29 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-gnu
+          targets: aarch64-unknown-linux-musl
 
-      # UDR is aarch64; no aarch64 GitHub runners, so cross-link with the
-      # distro toolchain. No aarch64 system libs are needed: the only
-      # link-time deps are libc.
-      - name: Install cross linker
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      # The UDR's glibc (UniFi OS, ~2.31) is older than any GitHub runner's,
+      # so a gnu build fails with "GLIBC_2.xx not found" on the device.
+      # Link musl statically instead: the binary then has no libc
+      # dependency at all. musl.cc provides the aarch64 cross toolchain.
+      - name: Install musl cross toolchain
+        run: |
+          curl -fsSLO https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar xzf aarch64-linux-musl-cross.tgz
+          echo "$PWD/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
 
-      - name: Build rerrb (aarch64)
+      - name: Build rerrb (aarch64, static musl)
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+        run: |
+          cargo build --release --locked --target aarch64-unknown-linux-musl
+          aarch64-linux-musl-readelf -d target/aarch64-unknown-linux-musl/release/rerrb | grep NEEDED || echo "fully static"
 
       - name: Package .deb
         run: |
           cargo install cargo-deb --locked
-          cargo deb --no-build --target aarch64-unknown-linux-gnu --output rerrb_arm64.deb
+          cargo deb --no-build --target aarch64-unknown-linux-musl --output rerrb_arm64.deb
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

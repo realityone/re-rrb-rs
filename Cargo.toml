@@ -9,9 +9,9 @@ description = "Relay UniFi 802.11r RRB frames from switch ports into the bridge 
 name = "rerrb"
 path = "src/main.rs"
 
-# cargo-deb: `cargo deb --no-build --target aarch64-unknown-linux-gnu`.
-# No $auto in depends: dpkg-shlibdeps cannot resolve aarch64 libs in the
-# x86_64 CI container; libc6 is essential anyway and iproute2 provides tc/ip.
+# cargo-deb: `cargo deb --no-build --target aarch64-unknown-linux-musl`.
+# No $auto in depends: the release binary is static musl, so there are no
+# shared libraries for dpkg-shlibdeps to resolve; iproute2 provides tc/ip.
 [package.metadata.deb]
 maintainer = "realityone <realityone@me.com>"
 section = "net"
