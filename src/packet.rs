@@ -235,7 +235,8 @@ fn recvmsg(fd: i32, buf: &mut [u8]) -> std::io::Result<Option<(usize, Vlan)>> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    // glibc uses size_t here, musl uses socklen_t; 64 bytes fits either.
+    msg.msg_controllen = control.len() as _;
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
         return Err(std::io::Error::last_os_error());

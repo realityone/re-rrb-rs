@@ -243,3 +243,28 @@ fn empty_peer_list_accepts_all_senders() {
         Counter::DestinationBss
     );
 }
+
+#[test]
+fn s1kh_client_mac_is_extracted_but_never_a_gate() {
+    let client = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let auth = [tlv(1, b"nonce"), tlv(parse::TLV_S1KH, &client)].concat();
+    let f = frame(parse::KIND_PULL, false, &auth);
+    let m = classify(&f.as_slice(), Vlan::default(), &filter()).unwrap();
+    assert_eq!(m.s1kh, Some(client));
+    // No S1KH TLV at all: still a valid frame, just no client identity.
+    let f = frame(parse::KIND_PULL, false, &tlv(1, b"nonce"));
+    assert_eq!(
+        classify(&f.as_slice(), Vlan::default(), &filter())
+            .unwrap()
+            .s1kh,
+        None
+    );
+    // Malformed length (not ETH_ALEN): ignored, frame still accepted.
+    let f = frame(parse::KIND_PULL, false, &tlv(parse::TLV_S1KH, b"short"));
+    assert_eq!(
+        classify(&f.as_slice(), Vlan::default(), &filter())
+            .unwrap()
+            .s1kh,
+        None
+    );
+}
