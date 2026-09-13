@@ -1,0 +1,23 @@
+[Unit]
+Description=rerrb - relay UniFi 802.11r RRB frames into the bridge
+Documentation=https://github.com/realityone/re-rrb-rs
+# rerrb resolves BSSIDs from the running hostapd (control sockets under
+# /run/hostapd/wifi*) and the sysfs MACs of the AP interfaces, so hostapd
+# must be up first. On UniFi OS hostapd runs as hostapd-global (a global
+# daemon whose per-BSS setup is backgrounded by hostapd.sh); ordering alone
+# is not enough — rerrb additionally retries the socket discovery on
+# startup, see bssids_with_retry in src/config.rs.
+After=network-online.target hostapd-global.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rerrb run --config /etc/rerrb/config.yaml
+# A crashed daemon leaves nothing behind (non-persistent TAP), so a plain
+# restart is a complete recovery.
+Restart=on-failure
+RestartSec=2
+Environment=RUST_LOG=rerrb=info
+
+[Install]
+WantedBy=multi-user.target

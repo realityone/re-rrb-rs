@@ -28,8 +28,8 @@ fn filter() -> Filter {
 }
 
 /// Build a complete wire frame: Ethernet header, inline VLAN 1 tag, RRB
-/// header, `auth` TLV bytes, and the 16-byte trailer (zeroed; contents are
-/// not validated by the parser).
+/// header, `auth` TLV bytes, and a 16-byte AES-SIV tag for an empty encrypted
+/// payload (zeroed; cryptographic contents are not validated by the parser).
 fn frame(kind: u8, broadcast: bool, auth: &[u8]) -> Vec<u8> {
     let f = filter();
     let mut out = Vec::new();
@@ -47,7 +47,7 @@ fn frame(kind: u8, broadcast: bool, auth: &[u8]) -> Vec<u8> {
     });
     out.extend((auth.len() as u16).to_le_bytes());
     out.extend(auth);
-    out.extend([0u8; parse::TRAILER_LEN]);
+    out.extend([0u8; parse::SIV_LEN]);
     out
 }
 
@@ -245,26 +245,29 @@ fn empty_peer_list_accepts_all_senders() {
 }
 
 #[test]
-fn s1kh_client_mac_is_extracted_but_never_a_gate() {
-    let client = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
-    let auth = [tlv(1, b"nonce"), tlv(parse::TLV_S1KH, &client)].concat();
-    let f = frame(parse::KIND_PULL, false, &auth);
-    let m = classify(&f.as_slice(), Vlan::default(), &filter()).unwrap();
-    assert_eq!(m.s1kh, Some(client));
-    // No S1KH TLV at all: still a valid frame, just no client identity.
-    let f = frame(parse::KIND_PULL, false, &tlv(1, b"nonce"));
-    assert_eq!(
-        classify(&f.as_slice(), Vlan::default(), &filter())
-            .unwrap()
-            .s1kh,
-        None
-    );
-    // Malformed length (not ETH_ALEN): ignored, frame still accepted.
-    let f = frame(parse::KIND_PULL, false, &tlv(parse::TLV_S1KH, b"short"));
-    assert_eq!(
-        classify(&f.as_slice(), Vlan::default(), &filter())
-            .unwrap()
-            .s1kh,
-        None
-    );
+fn encrypted_payload_is_never_scanned_or_misparsed() {
+    let c = filter();
+    let auth = [
+        tlv(2, &[0; 16]), // NONCE
+        tlv(1, &[0; 12]), // SEQ: domain, sequence number, timestamp
+        tlv(parse::TLV_R0KH, b"020000000102"),
+        tlv(parse::TLV_R1KH, &c.locals[0].bssid),
+    ]
+    .concat();
+    for kind in [parse::KIND_PULL, parse::KIND_RESPONSE, parse::KIND_PUSH] {
+        let mut f = frame(kind, false, &auth);
+        // Ciphertext after the SIV tag is opaque, even if its bytes happen
+        // to look exactly like a cleartext TLV (tag 6 = hostapd S1KH-ID).
+        // The TLV walk must end at the auth-data boundary and accept.
+        f.extend(tlv(6, &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert!(classify(&f.as_slice(), Vlan::default(), &c).is_ok());
+        let stripped = [&f[..12], &f[16..]].concat();
+        assert_eq!(stripped.len(), 122);
+        let vlan = Vlan {
+            present: true,
+            proto: parse::TPID_8021Q,
+            tci: 1,
+        };
+        assert!(classify(&stripped.as_slice(), vlan, &c).is_ok());
+    }
 }

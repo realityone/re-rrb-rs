@@ -223,8 +223,8 @@ impl Settings {
                 match &all_bssids {
                     Some(v) => v.clone(),
                     None => {
-                        let v = crate::hostapd::bssids()
-                            .context("discover local BSSIDs from hostapd")?;
+                        let v =
+                            bssids_with_retry().context("discover local BSSIDs from hostapd")?;
                         all_bssids = Some(v.clone());
                         v
                     }
@@ -268,6 +268,23 @@ fn sysfs_mac(name: &str) -> Result<[u8; 6]> {
     let text = std::fs::read_to_string(format!("/sys/class/net/{name}/address"))
         .with_context(|| format!("read MAC of {name}"))?;
     mac(text.trim())
+}
+
+/// hostapd BSSIDs with startup tolerance: on UniFi OS hostapd-global
+/// backgrounds its per-BSS setup (nohup in ExecStartPost), so the
+/// /run/hostapd/wifi* control sockets can appear tens of seconds after the
+/// unit is "started". Poll for up to ~30s before giving up; 1s between
+/// attempts keeps a permanently-broken setup from hanging boot forever.
+fn bssids_with_retry() -> Result<Vec<[u8; 6]>> {
+    let mut last_err = None;
+    for _ in 0..30 {
+        match crate::hostapd::bssids() {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Err(last_err.expect("loop runs at least once"))
 }
 
 /// "xx:xx:xx:xx:xx:xx" (hex, any case) into bytes.

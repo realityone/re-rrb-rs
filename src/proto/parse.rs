@@ -6,7 +6,7 @@
 //!
 //! ```text
 //!  0        6        12   14           18
-//!  | dst MAC | src MAC | TPID | TCI | EtherType | RRB header | auth TLVs | trailer |
+//!  | dst MAC | src MAC | TPID | TCI | EtherType | RRB header | auth TLVs | encrypted payload |
 //!                         `-- 802.1Q tag (4 bytes, optional, see below)
 //! ```
 //!
@@ -62,19 +62,18 @@ pub const TLV_R0KH: u16 = 4;
 /// 6 bytes, conventionally the target BSS's MAC).
 pub const TLV_R1KH: u16 = 5;
 
-/// TLV tag carrying the S1KH-ID (hostapd FT_RRB_S1KH_ID): the roaming
-/// client's MAC address. Present on PULL/PUSH; the key to "which device is
-/// roaming" in the logs.
-pub const TLV_S1KH: u16 = 6;
+// (hostapd FT_RRB_S1KH_ID = 6, the roaming client's MAC, is never read:
+// hostapd puts it in the AES-SIV encrypted payload of PULL/RESPONSE/PUSH,
+// outside the cleartext TLVs this parser walks.)
 
 /// Fixed header length of one TLV: 2-byte tag + 2-byte size, both
 /// little-endian per the RRB-over-Ethernet wire format.
 pub const TLV_HEADER_LEN: usize = 4;
 
-/// Trailing authenticator appended after the auth-data block; its length is
-/// part of the frame geometry check but its contents are not validated here
-/// (hostapd remains the cryptographic authority).
-pub const TRAILER_LEN: usize = 16;
+/// AES-SIV's 16-byte authentication tag prefixes the encrypted payload after
+/// the cleartext auth-data block, even when the encrypted plaintext is empty.
+/// Only this minimum length is checked; hostapd decrypts and authenticates.
+pub const SIV_LEN: usize = 16;
 
 /// Broadcast destination, written longhand where comparisons happen.
 pub const BROADCAST: [u8; 6] = [255; 6];
@@ -122,9 +121,6 @@ pub struct Match {
     /// Offset of the RRB header: 14 with a metadata tag, 18 with an inline
     /// tag. Kept so callers can locate the body without re-parsing VLANs.
     pub body_offset: usize,
-    /// Roaming client's MAC from the S1KH-ID TLV, when present and well
-    /// formed (exactly 6 bytes). Purely informational — never a gate.
-    pub s1kh: Option<[u8; 6]>,
 }
 
 /// Full ingress gate: geometry, VLAN scope, Ethernet addresses, RRB header,
@@ -224,7 +220,7 @@ pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, f: &Filter) -> Result<Match, 
     // Auth-data length is little-endian on the wire.
     let alen = u16::from_le_bytes([header[18], header[19]]) as usize;
     let end = body + RRB_HEADER_LEN + alen;
-    if end + TRAILER_LEN > r.len() {
+    if end + SIV_LEN > r.len() {
         return Err(Counter::AuthLength);
     }
 
@@ -234,7 +230,6 @@ pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, f: &Filter) -> Result<Match, 
     let mut tags = [0u16; MAX_TLVS];
     let mut r0kh_position = 0;
     let mut r0kh_size = 0;
-    let mut s1kh = None;
     for i in 0..MAX_TLVS {
         if pos == end {
             break;
@@ -258,9 +253,6 @@ pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, f: &Filter) -> Result<Match, 
         if tag == TLV_R0KH {
             r0kh_position = pos;
             r0kh_size = size;
-        }
-        if tag == TLV_S1KH && size == 6 {
-            s1kh = r.read::<6>(pos);
         }
         pos += size;
     }
@@ -305,6 +297,5 @@ pub fn parse_rrb<R: ReadFrame>(r: &R, body: usize, f: &Filter) -> Result<Match, 
     Ok(Match {
         kind: header[5],
         body_offset: body,
-        s1kh,
     })
 }

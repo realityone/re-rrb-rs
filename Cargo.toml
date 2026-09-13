@@ -1,22 +1,61 @@
 [package]
 name = "rerrb"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 license = "MIT"
+description = "Relay UniFi 802.11r RRB frames from switch ports into the bridge hostapd listens on"
 
 [[bin]]
 name = "rerrb"
 path = "src/main.rs"
 
+# cargo-deb: `cargo deb --no-build --target aarch64-unknown-linux-gnu`.
+# No $auto in depends: dpkg-shlibdeps cannot resolve aarch64 libs in the
+# x86_64 CI container; libc6 is essential anyway and iproute2 provides tc/ip.
+[package.metadata.deb]
+maintainer = "realityone <realityone@me.com>"
+section = "net"
+priority = "optional"
+depends = "iproute2, init-system-helpers"
+extended-description = """\
+Passive AF_PACKET capture on the switch-facing ports, fail-closed RRB
+validation in userspace, and a single self-cleaning tc mirred rule on a
+private TAP that injects matching frames into br0's RX path, where the
+UDR's hostapd listens. No eBPF, no switch/VLAN/hostapd config changes;
+killing the process removes every trace."""
+assets = [
+    # cargo-deb rewrites target/release to target/<triple>/release with --target
+    ["target/release/rerrb", "usr/bin/rerrb", "755"],
+    ["config/example.yaml", "etc/rerrb/config.yaml", "644"],
+    ["README.md", "usr/share/doc/rerrb/README.md", "644"],
+]
+# Edits to /etc/rerrb/config.yaml survive package upgrades.
+conf-files = ["etc/rerrb/config.yaml"]
+
+# Must be set (even to an otherwise empty dir) or cargo-deb silently skips
+# generating the systemd enable/start maintainer scripts.
+maintainer-scripts = "debian/"
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "debian/"
+enable = true
+start = true
+restart-after-upgrade = true
+
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+# No default features: drops color/suggestions; a daemon CLI doesn't need
+# them, and every binary byte ships in the deb.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# default-features = false drops the "regex" feature (env-filter still
+# supports the target=level directives we use, e.g. RUST_LOG=rerrb=debug)
+# and ansi colors (output goes to journald).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "env-filter"] }
 tun-rs = { version = "2", features = ["async"] }
 
 [lints.rust]
@@ -29,6 +68,11 @@ all = { level = "warn", priority = -1 }
 opt-level = 2
 overflow-checks = false
 
+# Size-tuned: the deb is scp'd onto a router. The hot path is a handful of
+# frames per roam, so size always wins over speed here.
 [profile.release]
-lto = true
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
+strip = true
+panic = "abort"

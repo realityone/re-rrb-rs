@@ -1,0 +1,42 @@
+# Build the aarch64 .deb and attach it to a GitHub release.
+# Trigger: push a version tag, e.g. `git tag v0.1.0 && git push --tags`.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      # UDR is aarch64; no aarch64 GitHub runners, so cross-link with the
+      # distro toolchain. No aarch64 system libs are needed: the only
+      # link-time deps are libc.
+      - name: Install cross linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build rerrb (aarch64)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target aarch64-unknown-linux-gnu
+
+      - name: Package .deb
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build --target aarch64-unknown-linux-gnu --output rerrb_arm64.deb
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rerrb_arm64.deb
+          generate_release_notes: true

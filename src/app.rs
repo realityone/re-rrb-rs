@@ -68,14 +68,12 @@ async fn capture(
                         bump(&counters, Counter::Matched);
                         bump(&counters, relay::kind_counter(m.kind));
                         // Per-frame detail at debug: RRB frames are rare (a
-                        // handful per roam), so this stays cheap. `client`
-                        // is the roaming device's MAC (S1KH-ID TLV).
+                        // handful per roam), so this stays cheap.
                         debug!(
                             source = sock.name,
                             kind = relay::kind_name(m.kind),
                             from = relay::mac_string(frame[6..12].try_into().unwrap()),
                             to = relay::mac_string(frame[0..6].try_into().unwrap()),
-                            client = m.s1kh.map(|s| relay::mac_string(&s)),
                             len = n,
                             "rrb frame matched"
                         );
