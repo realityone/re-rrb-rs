@@ -22,19 +22,17 @@ jobs:
       # The UDR's glibc (UniFi OS, ~2.31) is older than any GitHub runner's,
       # so a gnu build fails with "GLIBC_2.xx not found" on the device.
       # Link musl statically instead: the binary then has no libc
-      # dependency at all. musl.cc provides the aarch64 cross toolchain.
-      - name: Install musl cross toolchain
-        run: |
-          curl -fsSLO https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar xzf aarch64-linux-musl-cross.tgz
-          echo "$PWD/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+      # dependency at all. musl.cc is unreachable from GitHub Actions, so
+      # the toolchain comes from cross's Docker image on ghcr.io (GitHub's
+      # own registry).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build rerrb (aarch64, static musl)
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
         run: |
-          cargo build --release --locked --target aarch64-unknown-linux-musl
-          aarch64-linux-musl-readelf -d target/aarch64-unknown-linux-musl/release/rerrb | grep NEEDED || echo "fully static"
+          cross build --release --locked --target aarch64-unknown-linux-musl
+          readelf -d target/aarch64-unknown-linux-musl/release/rerrb | grep NEEDED || echo "fully static"
 
       - name: Package .deb
         run: |
