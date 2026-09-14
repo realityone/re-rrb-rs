@@ -130,42 +130,22 @@ pub struct PacketSocket {
 }
 
 impl PacketSocket {
-    /// Open, bind, and filter a packet socket on `name`.
+    /// Configure a packet socket, then bind it to start capture on `name`.
     pub fn open(name: &str) -> Result<Self> {
         let ifindex = ifindex(name).context("resolve source interface")?;
-        // The socket protocol is in network byte order; ETH_P_ALL (3) means
-        // "every EtherType" — the cBPF filter below does the real narrowing.
-        let proto = i32::from(u16::to_be(libc::ETH_P_ALL as u16));
+        // Protocol 0 keeps capture inactive until the filter and metadata
+        // options are installed; bind below selects the interface and protocol.
         let fd = unsafe {
             libc::socket(
                 libc::AF_PACKET,
                 libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                proto,
+                0,
             )
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error()).context("socket(AF_PACKET)");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let addr = libc::sockaddr_ll {
-            sll_family: libc::AF_PACKET as u16,
-            sll_protocol: u16::to_be(libc::ETH_P_ALL as u16),
-            sll_ifindex: ifindex as i32,
-            sll_hatype: 0,
-            sll_pkttype: 0,
-            sll_halen: 0,
-            sll_addr: [0; 8],
-        };
-        let rc = unsafe {
-            libc::bind(
-                fd.as_raw_fd(),
-                (&raw const addr).cast::<libc::sockaddr>(),
-                size_of::<libc::sockaddr_ll>() as u32,
-            )
-        };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error()).context("bind packet socket");
-        }
         let prog = SockFprog {
             len: SOCKET_FILTER.len() as u16,
             filter: SOCKET_FILTER.as_ptr(),
@@ -197,6 +177,41 @@ impl PacketSocket {
         };
         if rc < 0 {
             return Err(std::io::Error::last_os_error()).context("enable PACKET_AUXDATA");
+        }
+        // Skip outgoing traffic before the kernel clones or filters it for
+        // this socket. Keep the recvmsg direction check as a defensive guard.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_PACKET,
+                libc::PACKET_IGNORE_OUTGOING,
+                (&raw const one).cast::<libc::c_void>(),
+                size_of::<libc::c_int>() as u32,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("enable PACKET_IGNORE_OUTGOING");
+        }
+        // Binding with ETH_P_ALL (in network byte order) activates capture
+        // only on this interface; the cBPF filter narrows the EtherTypes.
+        let addr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as u16,
+            sll_protocol: u16::to_be(libc::ETH_P_ALL as u16),
+            sll_ifindex: ifindex as i32,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 0,
+            sll_addr: [0; 8],
+        };
+        let rc = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&raw const addr).cast::<libc::sockaddr>(),
+                size_of::<libc::sockaddr_ll>() as u32,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error()).context("bind packet socket");
         }
         Ok(Self {
             fd: AsyncFd::new(fd).context("register packet socket with tokio")?,
