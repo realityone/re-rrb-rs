@@ -1,6 +1,6 @@
 [package]
 name = "rerrb"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 license = "MIT"
 description = "Relay UniFi 802.11r RRB frames from switch ports into the bridge hostapd listens on"
